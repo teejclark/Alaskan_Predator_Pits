@@ -1,802 +1,469 @@
 #### CODE FOR PREDATOR-PIT MANUSCRIPT
+#### Clark-Wolf et al., Journal of Animal Ecology
+#### Wolf-moose predator pit dynamics, Tanana Flats, Alaska (1963-2013)
 
 library(tidyverse)
 library(ggplot2)
+library(patchwork)
+library(imputeTS)
+library(depmixS4)
+library(rEDM)
 
 # import data
 dat <- read.csv("finaldata.csv")
 
 ##################################################################################################################
+#### DATA PREPARATION ####
 
-#### LOOK AT DATA
-
-# plot moose, wolf, and caribou densities over time
-ggplot(dat[!is.na(dat$Moose.Density),], aes(Year, Moose.Density))+
-  geom_point(size = 2)+
-  geom_line(size = 1.5)
-
-ggplot(dat[!is.na(dat$No..Caribou),], aes(Year, No..Caribou))+
-  geom_point(size = 2)+
-  geom_line(size = 1.5)
-
-ggplot(dat[!is.na(dat$Wolf.Density),], aes(Year, Wolf.Density))+
-  geom_point(size = 2)+
-  geom_line(size = 1.5)
-
-# plot wolf density vs. moose growth rate
-ggplot(dat, aes(Wolf.Density, Moose.Lambda, color = Period))+
-  geom_point(size = 2)+
-  geom_smooth(method = "lm")
-
-summary(glm(Moose.Lambda ~ Wolf.Density + Period, data = dat))
-
-blaha <- dat[dat$Period == "pre-control",]
-blahb <- dat[dat$Period == "post-control",]
-
-summary(glm(Moose.Lambda ~ Wolf.Density, data = blaha)) # beta = -0.0345, p<0.0001; r^2=0.787
-summary(glm(Moose.Lambda ~ Wolf.Density, data = blahb)) # beta =-0.0213, p=0.104; r^2=0.222
-
+# interpolate missing values in wolf and moose counts/densities
+dat$No.Wolves_int <- na_interpolation(dat$No..Wolves)
+dat$No.Moose_int <- na_interpolation(dat$No..Moose)
 dat$Moose.Density_int <- na_interpolation(dat$Moose.Density)
 dat$Wolf.Density_int <- na_interpolation(dat$Wolf.Density)
 
-# plot wolves vs. moose
-ggplot(dat, aes(x = Year))+
-  geom_segment(x = 1976, xend = 1976, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 1)+
-  geom_segment(x = 1983, xend = 1983, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 1)+
-  annotate("rect", xmin = 1976, xmax = 1983, ymin = 0, ymax = Inf, alpha = 0.5)+
-  geom_line(aes(y = Moose.Density_int*10, color = "Moose"), size = 1, lwd = 2) +
-  geom_line(aes(y = Wolf.Density_int, color = "Wolves"), size = 1, lwd = 2) +
-  scale_y_continuous(
-    name = expression(paste("Wolf Density (# per 1,000 ", km^2, ")")),
-    sec.axis = sec_axis(~./10, name = expression(paste("Moose Density (# per ", km^2, ")")))
-  ) +
-  scale_color_manual(
-    values = c("Moose" = "#3d348b", "Wolves" = "#f35b04"),
-    guide = guide_legend(title = NULL)
-  ) +
-  theme_classic()+
-  theme(
-    legend.position = "none",
-    panel.border = element_blank(), panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    axis.line = element_line(colour = "black"),
-    axis.title = element_text(size=20),
-    axis.text = element_text(size=18, color="black"),
-    legend.title = element_text(size = 20),
-    legend.text = element_text(size = 18),
-    axis.text.y.right = element_text(margin = margin(r = 10)),
-    axis.title.y.right = element_text(margin = margin(r = 20)))
+# calculate moose population growth rate (lambda = N[t+1]/N[t])
+dat$Moose.Lambda_int <- c(NA, dat$No.Moose_int[2:length(dat$No.Moose_int)] /
+                               dat$No.Moose_int[1:(length(dat$No.Moose_int) - 1)])
 
-ggsave("figure1_alt.png", width = 10, height = 7, dpi = 600)
+# Period: pre- vs. post-wolf-control (1963-1982 vs. 1983-2013)
+dat <- dat %>%
+  mutate(Period = case_when(
+    Year >= 1963 & Year <= 1982 ~ "pre-control",
+    Year >= 1983 & Year <= 2013 ~ "post-control"
+  ))
+
+# Period2: HMM-identified density states
+# high density (initial) = 1963-1970; low density = 1971-1986; high density (post-recovery) = 1987-2013
+dat <- dat %>%
+  mutate(Period2 = case_when(
+    Year >= 1963 & Year <= 1970 ~ "High density (1963-1970)",
+    Year >= 1971 & Year <= 1986 ~ "Low density (1971-1986)",
+    Year >= 1987 & Year <= 2013 ~ "High density (1987-2013)"
+  ),
+  Period2 = factor(Period2, levels = c("High density (1963-1970)",
+                                        "Low density (1971-1986)",
+                                        "High density (1987-2013)")))
+
+# state-specific subsets used throughout
+blaha <- dat[dat$Period == "pre-control", ]
+blahb <- dat[dat$Period == "post-control", ]
+blahc <- dat[dat$Period2 == "High density (1963-1970)", ]
+blahd <- dat[dat$Period2 == "Low density (1971-1986)", ]
+blahe <- dat[dat$Period2 == "High density (1987-2013)", ]
 
 ##################################################################################################################
+#### FIGURE 1: wolf/moose densities and covariates over time ####
 
-#### INTERPOLATE DATA
-# NOTE: This is STEP 1b - we showed hysteresis by testing for time-dependent driver-response relationships
-
-library(imputeTS)
-
-dat$No.Wolves_int <- na_interpolation(dat$No..Wolves)
-#dat$No.Wolves_int <- na_interpolation(dat$No..Wolves.Edit)
-dat$No.Moose_int <- na_interpolation(dat$No..Moose)
-
-# change graphs to density for easier visualization
-a <- ggplot(dat, aes(Year, Moose.Density_int))+
-  geom_line(size = 1.5)+
-  geom_point(size = 3, color = "red")+
-  ylab("No. Moose")+
-  theme_classic()
-
-b <- ggplot(dat, aes(Year, Wolf.Density_int))+
-  geom_line(size = 1.5)+
-  geom_point(size = 3, color = "red")+
-  ylab("No. Wolves")+
-  theme_classic()
-
-a+b
-
-# graph imputation
-a <- ggplot(dat)+
-  geom_line(aes(x = Year, y = No.Moose_int), lwd = 1, color = "blue")+
-  geom_point(aes(x = Year, y = No.Moose_int), size = 3, color = "red")+
-  geom_point(aes(x = Year, y = No..Moose), size = 3, color = "blue")+
-  ylab("# Moose")+
-  theme_classic()+
+p1 <- ggplot(dat, aes(x = Year)) +
+  geom_segment(x = 1976, xend = 1976, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 1) +
+  geom_segment(x = 1983, xend = 1983, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 1) +
+  annotate("rect", xmin = 1976, xmax = 1983, ymin = 0, ymax = Inf, alpha = 0.5) +
+  geom_line(aes(y = Moose.Density_int * 10, color = "Moose"), lwd = 2) +
+  geom_line(aes(y = Wolf.Density_int, color = "Wolves"), lwd = 2) +
+  scale_y_continuous(
+    name = expression(paste("Wolf Density (# per 1,000 ", km^2, ")")),
+    sec.axis = sec_axis(~. / 10, name = expression(paste("Moose Density (# per ", km^2, ")")))
+  ) +
+  scale_color_manual(values = c("Moose" = "#3d348b", "Wolves" = "#f35b04"), guide = guide_legend(title = NULL)) +
+  theme_classic() +
   theme(
-    panel.border = element_blank(), panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
     axis.line = element_line(colour = "black"),
-    axis.title = element_text(size=20),
-    axis.text = element_text(size=18, color="black"),
-    legend.title = element_text(size = 20),
-    legend.text = element_text(size = 18))
+    axis.title = element_text(size = 20), axis.text = element_text(size = 18, color = "black"),
+    axis.text.y.right = element_text(margin = margin(r = 10)),
+    axis.title.y.right = element_text(margin = margin(r = 20)),
+    axis.text.x = element_text(size = 18), axis.title.x = element_text(size = 20)
+  )
 
-ggplot_na_imputations(dat$No..Moose, dat$No.Moose_int)
-ggplot_na_imputations(dat$No..Wolves.Edit, dat$No.Wolves_int)
-dat$No.Wolves_int[51] <- 280.275
-dat$No..Wolves.Edit[51] <- 280.275
-dat$No.Wolves_int[50] <- 234
+p2 <- ggplot(dat, aes(x = Year)) +
+  geom_segment(x = 1976, xend = 1976, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 0.8) +
+  geom_segment(x = 1983, xend = 1983, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 0.8) +
+  annotate("rect", xmin = 1976, xmax = 1983, ymin = 0, ymax = Inf, alpha = 0.5) +
+  geom_line(aes(y = Harvest..), color = "#e09f3e", lwd = 1.5) +
+  scale_y_continuous(name = "Total Moose Harvest\nRate (%)") +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 14), axis.text = element_text(size = 12, color = "black"))
 
-b <- ggplot(dat)+
-  geom_line(aes(x = Year, y = No.Wolves_int), lwd = 1, color = "blue")+
-  geom_point(aes(x = Year, y = No.Wolves_int), size = 3, color = "red")+
-  geom_point(aes(x = Year, y = No..Wolves.Edit), size = 3, color = "blue")+
-  ylab("# Wolves")+
-  theme_classic()+
-  theme(
-    panel.border = element_blank(), panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    axis.line = element_line(colour = "black"),
-    axis.title = element_text(size=20),
-    axis.text = element_text(size=18, color="black"),
-    legend.title = element_text(size = 20),
-    legend.text = element_text(size = 18))
+p3 <- ggplot(dat, aes(x = Year)) +
+  geom_segment(x = 1976, xend = 1976, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 0.8) +
+  geom_segment(x = 1983, xend = 1983, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 0.8) +
+  annotate("rect", xmin = 1976, xmax = 1983, ymin = 0, ymax = Inf, alpha = 0.5) +
+  geom_line(aes(y = Total.Snowfall..cm.), color = "#90e0ef", lwd = 1.5) +
+  scale_y_continuous(name = "Total Snowfall\n(cm)") +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 14), axis.text = element_text(size = 12, color = "black"))
 
-library(patchwork)
-a+b
+p4 <- ggplot(dat, aes(x = Year)) +
+  geom_segment(x = 1976, xend = 1976, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 0.8) +
+  geom_segment(x = 1983, xend = 1983, y = 0, yend = Inf, linetype = "dashed", color = "black", lwd = 0.8) +
+  annotate("rect", xmin = 1976, xmax = 1983, ymin = 0, ymax = Inf, alpha = 0.5) +
+  geom_line(aes(y = fire), color = "#c1121f", lwd = 1.5) +
+  scale_y_continuous(name = "Habitat Quality\n(ha burned,\n10-20yr lag)") +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 14), axis.text = element_text(size = 12, color = "black"))
+
+p1 / (p2 | p3 | p4) + plot_layout(heights = c(2, 1))
+ggsave("figure1.png", width = 12, height = 9, dpi = 600)
+
+##################################################################################################################
+#### FIGURE S1: interpolation of wolf and moose count data ####
+
+a <- ggplot(dat) +
+  geom_line(aes(x = Year, y = No.Moose_int), lwd = 1, color = "blue") +
+  geom_point(aes(x = Year, y = No.Moose_int), size = 3, color = "red") +
+  geom_point(aes(x = Year, y = No..Moose), size = 3, color = "blue") +
+  ylab("# Moose") +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 20), axis.text = element_text(size = 18, color = "black"))
+
+b <- ggplot(dat) +
+  geom_line(aes(x = Year, y = No.Wolves_int), lwd = 1, color = "blue") +
+  geom_point(aes(x = Year, y = No.Wolves_int), size = 3, color = "red") +
+  geom_point(aes(x = Year, y = No..Wolves.Edit), size = 3, color = "blue") +
+  ylab("# Wolves") +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 20), axis.text = element_text(size = 18, color = "black"))
+
+a + b
 ggsave("figure_s1.png", width = 12, height = 7, dpi = 600)
 
+##################################################################################################################
+#### FIGURE S3: wolf-moose phase diagram ####
 
-# calculate moose lambda
-dat$Moose.Lambda_int <- c(NA,dat$No.Moose_int[2:length(dat$No.Moose_int)]/dat$No.Moose_int[1:(length(dat$No.Moose_int)-1)])
+ggplot(dat, aes(x = Moose.Density_int, y = Wolf.Density_int)) +
+  geom_path(aes(color = Year), lwd = 1.2, lineend = "round") +
+  geom_point(aes(color = Year, shape = Period2), size = 3) +
+  scale_color_viridis_c(option = "plasma", name = "Year") +
+  scale_shape_manual(
+    values = c("High density (1963-1970)" = 16,
+               "Low density (1971-1986)" = 17,
+               "High density (1987-2013)" = 15),
+    name = "State"
+  ) +
+  labs(
+    x = expression(paste("Moose Density (# per ", km^2, ")")),
+    y = expression(paste("Wolf Density (# per 1,000 ", km^2, ")"))
+  ) +
+  theme_classic() +
+  theme(axis.title = element_text(size = 16), axis.text = element_text(size = 14, color = "black"),
+        legend.title = element_text(size = 14), legend.text = element_text(size = 12))
 
-ggplot(dat, aes(No.Wolves_int, Moose.Lambda_int, color = Period))+
-  geom_point(size = 2)+
-  geom_smooth(method = "lm")
+ggsave("figure_s3.png", dpi = 600, width = 10, height = 10)
 
-blaha <- dat[dat$Period == "pre-control",]
-blahb <- dat[dat$Period == "post-control",]
+##################################################################################################################
+#### HYSTERESIS ANALYSIS: wolf effect on moose growth, before vs. after wolf control ####
 
+# basic pre/post-control test
 summary(glm(Moose.Lambda_int ~ No.Wolves_int, data = blaha)) # beta = -0.00203, p<0.0001; r^2=0.665
 summary(glm(Moose.Lambda_int ~ No.Wolves_int, data = blahb)) # beta = -0.00111, p=0.11; r^2=0.085
 
-# plot time-dependent driver-response relationships
-ggplot(dat, aes(No.Wolves_int, Moose.Lambda_int, color = Period))+
-  geom_point(size = 3)+
-  geom_smooth(aes(fill = Period), method = "lm", se = T, lwd = 2)+
-  xlab("# Wolves")+
-  ylab("Moose Population Growth")+
-  scale_color_manual(
-    values = c("pre-control" = "#3d348b", "post-control" = "#f35b04"))+
-  scale_fill_manual(
-    values = c("pre-control" = "#3d348b", "post-control" = "#f35b04"))+
-  theme_classic()+
-  theme(
-    panel.border = element_blank(), panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    axis.line = element_line(colour = "black"),
-    axis.title = element_text(size=20),
-    axis.text = element_text(size=18, color="black"),
-    legend.title = element_text(size = 20),
-    legend.text = element_text(size = 18))
+# Figure 2: pre/post-control wolf-moose relationship
+ggplot(dat, aes(No.Wolves_int, Moose.Lambda_int, color = Period)) +
+  geom_point(size = 3) +
+  geom_smooth(aes(fill = Period), method = "lm", se = T, lwd = 2) +
+  xlab("# Wolves") + ylab("Moose Population Growth") +
+  scale_color_manual(values = c("pre-control" = "#3d348b", "post-control" = "#f35b04")) +
+  scale_fill_manual(values = c("pre-control" = "#3d348b", "post-control" = "#f35b04")) +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 20), axis.text = element_text(size = 18, color = "black"),
+        legend.title = element_text(size = 20), legend.text = element_text(size = 18))
 
-ggsave("figure2_alt.png", width = 10, height = 7, dpi = 600)
+ggsave("figure2.png", width = 10, height = 7, dpi = 600)
+
+# robustness check: controlling for cow harvest rate (response to initial review)
+summary(glm(Moose.Lambda ~ Wolf.Density + Cow.Harvest.Rate, data = blaha)) # beta = -0.0345, p<0.0001; r^2=0.787
+summary(glm(Moose.Lambda ~ Wolf.Density + Cow.Harvest.Rate, data = blahb)) # beta = -0.0213, p=0.104; r^2=0.222
+
+# expanded regression (Table S4): all hypothesized drivers simultaneously, response to Reviewer 2
+summary(glm(Moose.Lambda_int ~ No.Wolves_int + Cow.Harvest.Rate + Total.Snowfall..cm. + fire + Bull.Harvest.Rate,
+            data = blaha))
+summary(glm(Moose.Lambda_int ~ No.Wolves_int + Cow.Harvest.Rate + Total.Snowfall..cm. + fire + Bull.Harvest.Rate,
+            data = blahb))
+
+# state-specific regressions (Fig. S4): wolf effect by HMM-identified state
+summary(glm(Moose.Lambda_int ~ No.Wolves_int, data = blahc)) # high density (1963-1970)
+summary(glm(Moose.Lambda_int ~ No.Wolves_int, data = blahd)) # low density (1971-1986)
+summary(glm(Moose.Lambda_int ~ No.Wolves_int, data = blahe)) # high density (1987-2013)
+
+# Figure S4: state-dependent wolf-moose relationship
+ggplot(dat, aes(No.Wolves_int, Moose.Lambda_int, color = Period2)) +
+  geom_point(size = 3) +
+  geom_smooth(aes(fill = Period2), method = "lm", se = T, lwd = 2) +
+  xlab("# Wolves") + ylab("Moose Population Growth") +
+  scale_color_manual(
+    values = c("High density (1963-1970)" = "#7b2d8b",
+               "Low density (1971-1986)"  = "#f35b04",
+               "High density (1987-2013)" = "#3d348b"),
+    name = "State") +
+  scale_fill_manual(
+    values = c("High density (1963-1970)" = "#7b2d8b",
+               "Low density (1971-1986)"  = "#f35b04",
+               "High density (1987-2013)" = "#3d348b"),
+    name = "State") +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 20), axis.text = element_text(size = 18, color = "black"),
+        legend.title = element_text(size = 20), legend.text = element_text(size = 18))
+
+ggsave("figure_s4.png", width = 10, height = 7, dpi = 600)
 
 ##################################################################################################################
-
-#### CHANGEPOINT ANALYSIS
-
-library(depmixS4)
-
-# HIDDEN MARKOV MODEL
-
-# first, discard initial high data (first 3 data points)
-dat$No.Moose_int_disc <- dat$No.Moose_int
-
-# write HMM based on Chen et al. 2016
+#### FIGURE S2: Hidden Markov Model of moose density states ####
+# following Chen et al. 2016
 
 hmm <- function(observations){
-  mod <- depmix(No.Moose_int_disc~1, data = observations, nstates = 2,
-                trstart = runif(4), instart = c(15000,5000))
+  mod <- depmix(No.Moose_int ~ 1, data = observations, nstates = 2,
+                trstart = runif(4), instart = c(15000, 5000))
   fm <- fit(mod)
   results <- fm@posterior
-  results$state <- factor(results$state, levels = c("2", "1")) #as.character(results$state)
+  results$state <- factor(results$state, levels = c("2", "1"))
   bind_cols(observations, results)
 }
 
-set.seed(12345) # STOCHASTIC VALUE = 2 states
+set.seed(12345) # stochastic value yielding 2-state solution
 
-# plot?
 dat %>%
   hmm() %>%
-  ggplot(aes(Year, No.Moose_int_disc, col=state))+
-  geom_point(size = 2)+
-  ylab("# Moose")+
-  labs(color = "Stable State")+
-  scale_color_discrete(labels = c("Low", "High"))+
-  theme_classic()+
-  theme(
-    panel.border = element_blank(), panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    axis.line = element_line(colour = "black"),
-    axis.title = element_text(size=20),
-    axis.text = element_text(size=18, color="black"),
-    legend.title = element_text(size = 20),
-    legend.text = element_text(size = 18))
+  ggplot(aes(Year, No.Moose_int, col = state)) +
+  geom_point(size = 2) +
+  ylab("# Moose") +
+  labs(color = "Stable State") +
+  scale_color_discrete(labels = c("Low", "High")) +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 20), axis.text = element_text(size = 18, color = "black"),
+        legend.title = element_text(size = 20), legend.text = element_text(size = 18))
 
 ggsave("figure_s2.png", width = 10, height = 7, dpi = 600)
 
 ##################################################################################################################
+#### EMPIRICAL DYNAMIC MODELING (EDM) ####
+# following Deyle et al. (2017) Fish and Fisheries; https://ha0ye.github.io/rEDM/articles/rEDM.html
 
-#### LOOKING AT CAUSAL FACTORS
-#https://ha0ye.github.io/rEDM/articles/rEDM.html#real-data-examples
-#https://cran.r-project.org/web/packages/rEDM/vignettes/rEDM-tutorial.pdf
-# following: Deyle et al. (2017) Fish and Fisheries
-
-# STEPS: 1) simplex projection, identify E
-# 2) S-maps - quantify nonlinearity and usefulness of rEDM
-# 3) Univariate CCM - test for causation from different drives
-# 4) recreating Fig. 8 with block_lnlp
-
-library(rEDM)
-
-# scale vars and add to new dataset
+# scale variables
 reg <- as.data.frame(dat$Year); colnames(reg) <- c("time")
 reg$wolves <- scale(dat$No.Wolves_int)
 reg$snow <- scale(dat$Total.Snowfall..cm.)
 reg$harvest <- scale(dat$Harvest..)
 reg$moose <- scale(dat$No.Moose_int)
 reg$fire <- scale(dat$fire)
+reg$bull <- scale(dat$Bull.Harvest.Rate)
 
-# try editing out data
-
-# 1) First evaluate embedding dimension (E)
+# 1) embedding dimension (E)
 rho_E <- rEDM::EmbedDimension(dataFrame = reg, columns = "moose", target = "moose",
-                        lib = "1 26", pred = "27 51", showPlot = T)
-# E=9 has the best skill (E=2 for moose_pop)
+                               lib = "1 51", pred = "1 51", showPlot = T)
 
-# 2) Test for nonlinearity
-E <- 1
+# 2) test for nonlinearity
 rho_theta_E9 <- rEDM::PredictNonlinear(dataFrame = reg, columns = "moose", target = "moose",
-                                       lib = "1 26", pred = "27 51", E = E)
-# theta = >0; evidence for nonlinearity
+                                        lib = "1 49", pred = "1 49", E = E)
+# theta > 0; evidence for nonlinearity
 
+# 3) multivariate forecast skill (Table S1)
+lib <- c(1, NROW(reg)); pred <- c(1, NROW(reg))
 
-# 3) Multivariate Models - see if adding extra variables will improve predictions
-# ALL VARS
+# full model (all 4 hypothesized drivers)
+block_lnlp_full <- block_lnlp(reg, lib = lib, pred = pred,
+                               columns = c("wolves", "snow", "harvest", "fire"),
+                               target_column = "moose", stats_only = F,
+                               first_column_time = T, silent = T)
+obs <- block_lnlp_full$model_output[2]
+pred_full <- block_lnlp_full$model_output[3]
+blah <- data.frame(cbind(obs, pred_full))
+summary(lm(pred_full$Predictions ~ obs$Observations))
 
-# ALL VARIABLES;
-lib <- c(1, NROW(reg))
-pred <- c(1, NROW(reg))
-block_lnlp_output <- block_lnlp(reg, lib = lib, pred = pred, 
-                                columns = c("wolves","snow","harvest","fire"),
-                                target_column = "moose", stats_only = F,
-                                first_column_time = T, silent = T)
+# best model (wolves + harvest + fire, excluding snow)
+block_lnlp_best <- block_lnlp(reg, lib = lib, pred = pred,
+                               columns = c("wolves", "fire", "harvest"),
+                               target_column = "moose", stats_only = F,
+                               first_column_time = T, silent = T)
 
-obs <- block_lnlp_output$model_output[2]
-pred <- block_lnlp_output$model_output[3]
-blah <- data.frame(cbind(obs,pred))
-summary(lm(pred$Predictions ~ obs$Observations))
-
-# WOLVES SNOW HARVEST
-lib <- c(1, NROW(reg))
-pred <- c(1, NROW(reg))
-block_lnlp_output <- block_lnlp(reg, lib = lib, pred = pred, 
-                                columns = c("wolves","snow","harvest"),
-                                target_column = "moose", stats_only = F,
-                                first_column_time = T, silent = T)
-
-obs <- block_lnlp_output$model_output[2]
-pred <- block_lnlp_output$model_output[3]
-blah <- data.frame(cbind(obs,pred))
-
-# SNOW AND WOLVES
-lib <- c(1, NROW(reg))
-pred <- c(1, NROW(reg))
-block_lnlp_output2 <- block_lnlp(reg, lib = lib, pred = pred, 
-                                columns = c("wolves","snow"),
-                                target_column = "moose", stats_only = F,
-                                first_column_time = T, silent = T)
-
-obs2 <- block_lnlp_output2$model_output[2]
-pred2 <- block_lnlp_output2$model_output[3]
-blah2 <- data.frame(cbind(obs2,pred2))
-
-# WOLVES
-lib <- c(1, NROW(reg))
-pred <- c(1, NROW(reg))
-block_lnlp_output3 <- block_lnlp(reg, lib = lib, pred = pred, 
-                                 columns = c("wolves"),
+# univariate models
+block_lnlp_wolves <- block_lnlp(reg, lib = lib, pred = pred, columns = c("wolves"),
                                  target_column = "moose", stats_only = F,
                                  first_column_time = T, silent = T)
+block_lnlp_snow <- block_lnlp(reg, lib = lib, pred = pred, columns = c("snow"),
+                               target_column = "moose", stats_only = F,
+                               first_column_time = T, silent = T)
+block_lnlp_harvest <- block_lnlp(reg, lib = lib, pred = pred, columns = c("harvest"),
+                                  target_column = "moose", stats_only = F,
+                                  first_column_time = T, silent = T)
+block_lnlp_fire <- block_lnlp(reg, lib = lib, pred = pred, columns = c("fire"),
+                               target_column = "moose", stats_only = F,
+                               first_column_time = T, silent = T)
 
-obs3 <- block_lnlp_output3$model_output[2]
-pred3 <- block_lnlp_output3$model_output[3]
-blah3 <- data.frame(cbind(obs3,pred3))
+# Figure 4: forecast skill bar chart (Table S1)
+blah_fig4 <- data.frame(
+  category = c("All Vars", "Minus Snow", "Harvest", "Snow", "Fire", "Wolves"),
+  value = c(0.449, 0.561, 0.066, 0.087, 0.373, 0.023)
+)
 
-# SNOW
-lib <- c(1, NROW(reg))
-pred <- c(1, NROW(reg))
-block_lnlp_output4 <- block_lnlp(reg, lib = lib, pred = pred, 
-                                 columns = c("snow"),
-                                 target_column = "moose", stats_only = F,
-                                 first_column_time = T, silent = T)
-obs4 <- block_lnlp_output4$model_output[2]
-pred4 <- block_lnlp_output4$model_output[3]
-blah4 <- data.frame(cbind(obs4,pred4))
-
-# HARVEST
-lib <- c(1, NROW(reg))
-pred <- c(1, NROW(reg))
-block_lnlp_output5 <- block_lnlp(reg, lib = lib, pred = pred, 
-                                 columns = c("harvest"),
-                                 target_column = "moose", stats_only = F,
-                                 first_column_time = T, silent = T)
-obs5 <- block_lnlp_output5$model_output[2]
-pred5 <- block_lnlp_output5$model_output[3]
-blah5 <- data.frame(cbind(obs5,pred5))
-
-# FIRE
-lib <- c(1, NROW(reg))
-pred <- c(1, NROW(reg))
-block_lnlp_output5 <- block_lnlp(reg, lib = lib, pred = pred, 
-                                 columns = c("wolves", "fire"),
-                                 target_column = "moose", stats_only = F,
-                                 first_column_time = T, silent = T)
-obs5 <- block_lnlp_output5$model_output[2]
-pred5 <- block_lnlp_output5$model_output[3]
-blah5 <- data.frame(cbind(obs5,pred5))
-
-# HARVEST AND SNOW
-lib <- c(1, NROW(reg))
-pred <- c(1, NROW(reg))
-block_lnlp_output6 <- block_lnlp(reg, lib = lib, pred = pred, 
-                                 columns = c("snow","harvest"),
-                                 target_column = "moose", stats_only = F,
-                                 first_column_time = T, silent = T); block_lnlp_output5$stats
-obs6 <- block_lnlp_output6$model_output[2]
-pred6 <- block_lnlp_output6$model_output[3]
-blah6 <- data.frame(cbind(obs6,pred6))
-
-
-# create data.frame for bar graph
-blah <- data.frame(category = c("All Vars", "Minus Snow", "Harvest", "Snow", "Fire", "Wolves"),
-                   value = c(0.537, 0.581, 0.066, 0.087, 0.373, 0.023))
-
-ggplot(blah, aes(x = reorder(category, -value), y = value, fill = category))+
-  geom_bar(stat = "identity")+
+ggplot(blah_fig4, aes(x = reorder(category, -value), y = value, fill = category)) +
+  geom_bar(stat = "identity") +
   scale_fill_manual(values = c("All Vars" = "red", "Minus Snow" = "blue", "Harvest" = "green",
-                               "Snow" = "yellow", "Fire" = "pink", "Wolves" = "black"))+
-  xlab("Variables")+
-  ylab("R-Squared")+
-  theme_classic()+
-  theme(
-    panel.border = element_blank(), panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    axis.line = element_line(colour = "black"),
-    axis.title = element_text(size=24),
-    axis.text = element_text(size=18, color="black"),
-    legend.position = "none")
-
+                                "Snow" = "yellow", "Fire" = "pink", "Wolves" = "black")) +
+  xlab("Variables") + ylab("R-Squared") +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 24), axis.text = element_text(size = 18, color = "black"),
+        legend.position = "none")
 
 ggsave("figure4.png", width = 10, height = 7, dpi = 600)
 
 ##################################################################################################################
-#### Scenario Analysis - Moose ####
-# GOAL: can we stop the transition to a high density state?
+#### FIGURE S5: observed vs. predicted moose population size ####
 
-# add in embedded moose data for better prediction?
-reg$moose_embed <- c(embed(reg$moose, dimension = 2)[,1],NA)
+blah$Year <- reg$time[1:nrow(blah)]
 
-lib <- c(1, NROW(reg))
-pred <- c(1, NROW(reg))
-block_lnlp_output <- block_lnlp(reg, lib = lib, pred = pred, 
-                                columns = c("wolves","snow","harvest","fire", "moose_embed", "moose"),
+p_timeseries <- ggplot(blah, aes(x = 1:nrow(blah))) +
+  geom_line(aes(y = Observations, color = "Observed"), lwd = 1.5) +
+  geom_line(aes(y = Predictions, color = "Predicted"), lwd = 1.5, linetype = "dashed") +
+  scale_color_manual(values = c("Observed" = "#3d348b", "Predicted" = "#f35b04"), name = NULL) +
+  ylab("Std. Moose Population Size") + xlab("Year") +
+  theme_classic() +
+  theme(axis.title = element_text(size = 16), axis.text = element_text(size = 14, color = "black"),
+        legend.text = element_text(size = 14), legend.position = "top")
+
+p_correlation <- ggplot(blah, aes(x = Observations, y = Predictions)) +
+  geom_point(size = 3, color = "#3d348b") +
+  geom_smooth(method = "lm", se = TRUE, color = "#f35b04", fill = "#f35b04") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black", lwd = 1) +
+  xlab("Observed Std. Moose Population Size") + ylab("Predicted Std. Moose Population Size") +
+  theme_classic() +
+  theme(axis.title = element_text(size = 16), axis.text = element_text(size = 14, color = "black"))
+
+p_timeseries / p_correlation
+ggsave("figure_s5.png", width = 10, height = 14, dpi = 600)
+
+##################################################################################################################
+#### SCENARIO ANALYSIS: counterfactual wolf control (Figure 5) ####
+
+reg$moose_embed <- c(embed(reg$moose, dimension = 2)[, 1], NA)
+
+# full model fit check
+block_lnlp_check <- block_lnlp(reg, lib = c(1, NROW(reg)), pred = c(1, NROW(reg)),
+                                columns = c("wolves", "snow", "harvest", "fire", "moose_embed", "moose"),
                                 target_column = "moose", stats_only = F,
                                 first_column_time = T, silent = T)
-obs <- block_lnlp_output$model_output[2]
-pred <- block_lnlp_output$model_output[3]
-summary(lm(pred$Predictions ~ obs$Observations)) # r-squared is 0.8618, OK!
+obs_check <- block_lnlp_check$model_output[2]
+pred_check <- block_lnlp_check$model_output[3]
+summary(lm(pred_check$Predictions ~ obs_check$Observations)) # R^2 = 0.86
 
-# WOLVES #
-# NOTE: for now, just increase/decrease by 0.5SD
-wolves_increase <- reg$wolves + 2
-wolves_decrease <- reg$wolves -  2
+# counterfactual: unfavorable conditions throughout the post-control period
+# (lower wolves, harvest, snow, fire than observed)
+moose_unfavorable <- reg
+moose_unfavorable$wolves[19:51] <- moose_unfavorable$wolves[19:51] - 0.2
+moose_unfavorable$harvest[19:51] <- moose_unfavorable$harvest[19:51] - 0.46
+moose_unfavorable$snow[19:51] <- moose_unfavorable$snow[19:51] - 0.4
+moose_unfavorable$fire[19:51] <- moose_unfavorable$fire[19:51] - 2
 
-# make new datasets
-reg_inc0 <- reg
-reg_inc0$wolves <- wolves_increase
-reg_dec0 <- reg
-reg_dec0$wolves <- wolves_decrease
+reg_inc <- rbind(reg, rep(NaN, ncol(reg)), moose_unfavorable)
 
-# combine datasets for simulated time-series
-reg_inc <- rbind(reg, rep(NaN, ncol(reg)), reg_inc0)
-reg_dec <- rbind(reg, rep(NaN, ncol(reg)), reg_dec0)
+scenario_baseline <- block_lnlp(reg, method = "simplex",
+                                 columns = c("wolves", "snow", "harvest", "fire"),
+                                 target_column = "moose", stats_only = F, silent = T)
 
-scenario_reg <- block_lnlp(reg,
-                           method = "simplex",
-                           columns = c("wolves","snow","harvest","fire", "moose_embed", "moose"),
-                           target_column = "moose",
-                           stats_only = F,
-                           silent = T)
+scenario_unfavorable <- block_lnlp(reg_inc,
+                                    lib = c(1, nrow(reg)), pred = c((nrow(reg) + 2), nrow(reg_inc)),
+                                    method = "simplex",
+                                    columns = c("wolves", "snow", "harvest", "fire"),
+                                    target_column = "moose", stats_only = F, silent = T)
 
-scenario_inc <- block_lnlp(reg_inc,
-                           lib = c(1, nrow(reg)),
-                           pred = c((nrow(reg)+2), nrow(reg_inc)),
-                           method = "simplex",
-                           columns = c("wolves","snow","harvest","fire", "moose_embed", "moose"),
-                           target_column = "moose",
-                           stats_only = F,
-                           silent = T)
+wolves_nochange <- scenario_baseline$model_output
+wolves_increase <- scenario_unfavorable$model_output
 
-scenario_dec <- block_lnlp(reg_dec,
-                           lib = c(1, nrow(reg)),
-                           pred = c((nrow(reg)+2), nrow(reg_dec)),
-                           method = "simplex",
-                           columns = c("wolves","snow","harvest","fire", "moose_embed", "moose"),
-                           target_column = "moose",
-                           stats_only = F,
-                           silent = T)
-
-# plot
-wolves_nochange <- scenario_reg$model_output
-wolves_increase <- scenario_inc$model_output
-wolves_decrease <- scenario_dec$model_output
-
-plot(wolves_nochange$Observations,
-     type = "l", col = "black", lwd = 2, xlab = "time",
-     ylab = "Normalized Moose Population Size")
-points(wolves_nochange$Predictions, bg = "black", pch = 21) # normal prediction
-points(wolves_increase$Predictions, bg = "red", pch = 24) # increase wolves, all years
-points(wolves_decrease$Predictions, bg = "blue", pch = 25) # decrease wolves, all years
-
-
-## SCENARIO - NO WOLF CONTROL
-# would moose have increased to high density state without wolf control?
-# control was from 1976 to 1982 (row 14 to 20)
-wolves_increase <- reg$wolves
-wolves_increase[14:20,] <- wolves_increase[14:20,]+2
-plot(reg$time, reg$wolves, type = "l")
-points(reg$time, wolves_increase, col = "red", type = "l")
-
-reg_inc0 <- reg
-reg_inc0$wolves <- wolves_increase
-reg_inc <- rbind(reg, rep(NaN, ncol(reg)), reg_inc0)
-
-scenario_reg <- block_lnlp(reg,
-                           method = "simplex",
-                           columns = c("wolves","snow","harvest","fire", "moose_embed", "moose"),
-                           target_column = "moose",
-                           stats_only = F,
-                           silent = T)
-
-scenario_inc <- block_lnlp(reg_inc,
-                           lib = c(1, nrow(reg)),
-                           pred = c((nrow(reg)+2), nrow(reg_inc)),
-                           method = "simplex",
-                           columns = c("wolves","snow","harvest","fire", "moose_embed", "moose"),
-                           target_column = "moose",
-                           stats_only = F,
-                           silent = T)
-
-wolves_nochange <- scenario_reg$model_output
-wolves_increase <- scenario_inc$model_output
-
-plot(wolves_nochange$Observations,
-     type = "l", col = "black", lwd = 2, xlab = "time",
-     ylab = "Normalized Moose Population Size")
-points(wolves_nochange$Predictions, bg = "black", pch = 21) # normal prediction
-points(wolves_increase$Predictions, bg = "red", pch = 24) # increase wolves, all years
-
-
-## SCENARIO - Make everything bad for moose - maybe from 5 to 30
-# do they still shift back up?
-moose_increase <- reg
-moose_increase$wolves[19:51] <- moose_increase$wolves[19:51]+-.2#2 # more wolves
-moose_increase$harvest[19:51] <- moose_increase$harvest[19:51]+-.46#2 # more harvest
-moose_increase$snow[19:51] <- moose_increase$snow[19:51]+-.4#2 # more snow
-moose_increase$fire[19:51] <- moose_increase$fire[19:51]+-2 # decrease fire
-
-reg_inc <- rbind(reg, rep(NaN, ncol(reg)), moose_increase)
-
-scenario_reg <- block_lnlp(reg,
-                           method = "simplex",
-                           columns = c("wolves","snow","harvest","fire"),#,"moose"), #"moose_embed"),
-                           target_column = "moose",
-                           stats_only = F, 
-                           silent = T)
-
-scenario_inc <- block_lnlp(reg_inc,
-                           lib = c(1, nrow(reg)),
-                           pred = c((nrow(reg)+2), nrow(reg_inc)),
-                           method = "simplex",
-                           columns = c("wolves","snow","harvest","fire"),
-                           target_column = "moose",
-                           stats_only = F,
-                           silent = T)
-
-wolves_nochange <- scenario_reg$model_output
-wolves_increase <- scenario_inc$model_output
-
-plot(wolves_nochange$Observations,
-     type = "l", col = "black", lwd = 2, xlab = "time",
-     ylab = "Normalized Moose Population Size")
-points(wolves_nochange$Predictions, bg = "black", pch = 21) # normal prediction
-points(wolves_increase$Predictions, bg = "red", pch = 24) # increase wolves, all years
-
-# plot change together
 wolves_total <- data.frame(cbind(wolves_nochange, wolves_increase))
-wolves_total$year <-c(reg$time,NA) 
+wolves_total$year <- c(reg$time, NA)
 
-b <- ggplot(wolves_total)+
-  geom_line(aes(x = year, y = Observations), lwd = 2)+ 
-  #geom_point(aes(x= year, y = Predictions), col = "black", size = 2)+
-  geom_line(aes(x= year, y = Predictions.1), col = "red", size = 2)+
-  xlab("Year")+
-  ylab("Standardized Moose Population Size")+
-  theme_classic()+
-  theme(
-    panel.border = element_blank(), panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    axis.line = element_line(colour = "black"),
-    axis.title = element_text(size=24),
-    axis.text = element_text(size=18, color="black"),
-    legend.title = element_text(size = 24),
-    legend.text = element_text(size = 18))
+b <- ggplot(wolves_total) +
+  geom_line(aes(x = year, y = Observations), lwd = 2) +
+  geom_line(aes(x = year, y = Predictions.1), col = "red", size = 2) +
+  xlab("Year") + ylab("Standardized Moose Population Size") +
+  theme_classic() +
+  theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 24), axis.text = element_text(size = 18, color = "black"),
+        legend.title = element_text(size = 24), legend.text = element_text(size = 18))
 
 ggsave("figure5.png", width = 10, height = 7, dpi = 600)
 
-# combined figures
-library(patchwork)
-a+b+plot_annotation(tag_levels = "a")&theme(plot.tag = element_text(size = 24))
-
-ggsave("figure5_alt.png", width = 12, height = 7, dpi = 600)
-
 ##################################################################################################################
+#### SENSITIVITY ANALYSIS (Figure 3, Figure 6) ####
 
-#### SENSITIVITY ANALYSIS ####
-# NOTE: use timing of breakpoint to separate the two...
-# 2 state model = middle stable state; 1 state = doesn't change!!!! = go off of breakpoints!
-hmm <- function(observations){
-  mod <- depmix(Predictions~1, data = observations, nstates = 2)
-  fm <- fit(mod)
-  results <- fm@posterior
-  results$state <- as.character(results$state)
-  bind_cols(observations, results)
-}
-
-set.seed(12352) # STOCHASTIC VALUE = 2 breakpoints
-
-# plot?
-wolves_nochange[4:53,] %>%
-  hmm() %>%
-  ggplot(aes(Index, Predictions, col=state))+
-  geom_point(size = 2)+
-  #geom_line(size = 1.5)
-  theme_classic()
-
-# fucking around with data issues
-mod <- depmix(Predictions ~ 1, data = wolves_increase[4:53,], nstates = 2, instart = c(1,0))
-              #trstart = matrix(c(0.05,0.05,0.05,0.7)))
-fm <- fit(mod)
-results <- fm@posterior; results; identify_transition(results$state)
-
-
-# try last 30 vals
 identify_transition <- function(input_vector) {
-  # Take the last 20 values
-  last_20_values <- tail(input_vector, 30)
-  
-  # Calculate the average of the last 20 values
-  average_value <- mean(last_20_values)
-  
-  # Determine if the average is closer to 1 or 2
+  # classify state based on the average of the last 30 time points
+  last_30_values <- tail(input_vector, 30)
+  average_value <- mean(last_30_values)
   result <- ifelse(abs(average_value - 1) < abs(average_value - 2), 1, 0)
-  
   return(result)
+  # 1 = transitioned to high density state (escaped predator pit)
+  # 0 = did not transition (remained in predator pit)
 }
 
+simulate_state <- function(reg, wolves_val, harvest_val, snow_val, fire_val) {
 
-
-vector1 <- c(1,1,1,1,2,2,2)
-vector2 <- c(1,1,1,2,2,2,1,1,1)
-
-
-identify_transition(vector1) # FALSE (0)
-identify_transition(vector2) # TRUE (1)
-# 1= transitions to high density state; 0 = doesn't transition
-
-# test with real data...
-identify_transition(results$state) # TRUE
-identify_transition(results$state) # FALSE!!!!
-
-
-# START TO BUILD FUNCTION FOR EDM
-simulate_state <- function(reg, wolves_val, harvest_val, snow_val, fire_val){
-  
-  #EDM STUFF
-  # NOTE: changed to 17 from 11
   moose_increase <- reg
-  moose_increase$wolves[17:51] <- moose_increase$wolves[17:51]+wolves_val # more wolves
-  moose_increase$harvest[17:51] <- moose_increase$harvest[17:51]+harvest_val # more harvest
-  moose_increase$snow[17:51] <- moose_increase$snow[17:51]+snow_val # more snow
-  moose_increase$fire[17:51] <- moose_increase$fire[17:51]+fire_val # decrease fire
-  
+  moose_increase$wolves[17:51] <- moose_increase$wolves[17:51] + wolves_val
+  moose_increase$harvest[17:51] <- moose_increase$harvest[17:51] + harvest_val
+  moose_increase$snow[17:51] <- moose_increase$snow[17:51] + snow_val
+  moose_increase$fire[17:51] <- moose_increase$fire[17:51] + fire_val
+
   reg_inc <- rbind(reg, rep(NaN, ncol(reg)), moose_increase)
-  
+
   scenario_inc <- block_lnlp(reg_inc,
-                             lib = c(1, nrow(reg)),
-                             pred = c((nrow(reg)+2), nrow(reg_inc)),
-                             method = "simplex",
-                             columns = c("wolves","snow","harvest","fire"),
-                             target_column = "moose",
-                             stats_only = F,
-                             silent = T)
-  
+                              lib = c(1, nrow(reg)),
+                              pred = c((nrow(reg) + 2), nrow(reg_inc)),
+                              method = "simplex",
+                              columns = c("wolves", "snow", "harvest", "fire"),
+                              target_column = "moose",
+                              stats_only = F, silent = T)
+
   wolves_increase <- scenario_inc$model_output
-  
-  # CHANGEPOINT STUFF
-  #set.seed(12352)
-  mod <- depmix(Predictions ~ 1, data = wolves_increase[4:53,], nstates = 2, instart = c(1,0))
-                #trstart = matrix(c(0.05,0.05,0.05,0.5)))
+
+  mod <- depmix(Predictions ~ 1, data = wolves_increase[4:53, ], nstates = 2, instart = c(1, 0))
   fm <- fit(mod)
   results <- fm@posterior
-  identify_transition(results$state) 
-  # 1 = did transition to high density state (out of pred pit)
-  # 0 = did not transition (still in pred pit)
-  
+  identify_transition(results$state)
 }
 
-# set up for loop
+# randomized sensitivity analysis: vary each covariate by +/- 2 SD (uniform draw)
 nsims <- 10000
 wolves_val <- runif(nsims, -2, 2)
 harvest_val <- runif(nsims, -2, 2)
 snow_val <- runif(nsims, -2, 2)
 fire_val <- runif(nsims, -2, 2)
 change_dat <- data.frame(wolves_val, harvest_val, snow_val, fire_val,
-                         state_change = rep(NA,length(wolves_val)))
+                          state_change = rep(NA, length(wolves_val)))
 
-for (i in 1:nsims){
-  
-  change_dat$state_change[i] <- simulate_state(reg, 
-                                               change_dat$wolves_val[i],
-                                               change_dat$harvest_val[i],
-                                               change_dat$snow_val[i],
-                                               change_dat$fire_val[i]
-                                               )
-  
+for (i in 1:nsims) {
+  change_dat$state_change[i] <- simulate_state(reg,
+                                                change_dat$wolves_val[i],
+                                                change_dat$harvest_val[i],
+                                                change_dat$snow_val[i],
+                                                change_dat$fire_val[i])
 }
 
-# new analysis - keep things stable and change other things
-nsims <- 1000
-wolves_val <- 0 # more wolves (2)
-harvest_val <- 0 # more harvest (2)
-snow_val <- 0 # more snow (2)
-fire_val <- 0 # less fire (less habitat) (-2)
-change_dat <- as.vector(rep(NA, nsims))
-
-for (i in 1:nsims){
-  
-  change_dat[i] <- simulate_state(reg, 
-                                               wolves_val,
-                                               harvest_val,
-                                               snow_val,
-                                               fire_val
-  )
-  
-}
-
-length(change_dat[change_dat==1])/nsims
-
-# binomial GLM
-summary(glm(state_change ~ wolves_val + harvest_val + snow_val + fire_val,
-            data = change_dat, family = "binomial"))
-
-# increasing wolves = less likely to get out of predator pit (NEGATIVE) = CONFIRMED 
-# increasing harvest = less likely to get out of predator pit (NEGATIVE) = CONFIRMED 
-# increasing snow = less likely to get out of predator pit (NEGATIVE) = CONFIRMED 
-# increasing fire = more likely to get out of predator pit (POSITIVE) = CONFIRMED 
-
-# binomial GLM plot - create predict and maybe probability...
+# binomial GLM: likelihood of escaping the predator pit as a function of each covariate
 model <- glm(state_change ~ wolves_val + harvest_val + snow_val + fire_val,
-    data = change_dat, family = "binomial")
+             data = change_dat, family = "binomial")
+summary(model)
 
-dat <- data.frame(
-  covariate = c("Wolves", "Harvest", "Snow", "Fire"),
-  mean = c(-0.08471, -0.11275, -0.03010, 0.16051),
-  se = c(0.01742, 0.01748, 0.01751, 0.01748)
-)
-
-dat$covariate <- factor(dat$covariate, c("Fire", "Harvest", "Wolves", "Snow"))
-
-dat$lowerci <- dat$mean - 1.96*dat$se
-dat$upperci <- dat$mean + 1.96*dat$se
-
-a <- ggplot(dat, aes(x = covariate, y = mean))+
-  geom_point(position = position_dodge(width = 0.3), size = 4)+
-  geom_errorbar(
-    aes(ymin = lowerci, ymax = upperci),
-    position = position_dodge(width = 0.3),
-    width = 0.2, size = 1.5)+
-  geom_hline(yintercept = 0, linetype = "dashed")+
-  xlab("Covariates")+
-  ylab("Sensitivity Analysis Values")+
-  theme_classic()+
-  theme(
-    panel.border = element_blank(), panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    axis.line = element_line(colour = "black"),
-    axis.title = element_text(size=24),
-    axis.text = element_text(size=18, color="black"),
-    legend.title = element_text(size = 24),
-    legend.text = element_text(size = 18))
-
-ggsave("figure6.png", width = 10, height = 7, dpi = 600)
-
-##################################################################################################################
-
-# heatmap?
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-
-# Define the items
-items <- c(1, 2, 3, 4)
-
-# Generate all subsets
-all_subsets <- unlist(lapply(0:length(items), function(k) combn(items, k, simplify = FALSE)), recursive = FALSE)
-
-# Convert subsets to binary matrix
-binary_matrix <- lapply(all_subsets, function(subset) as.integer(items %in% subset)) %>%
-  do.call(rbind, .) %>%
-  as.data.frame()
-
-# Add subset names for labeling
-binary_matrix$Subset <- sapply(all_subsets, function(subset) paste0("{", paste(subset, collapse = ","), "}"))
-binary_matrix$names <- c("None","Wolves","Harvest","Snow","Fire",
-                         "Wolves + Harvest", "Wolves + Snow", "Wolves + Fire", "Harvest + Snow","Harvest + Fire", "Snow + Fire",
-                         "Wolves + Harvest + Snow", "Wolves + Harvest + Fire", "Wolves + Snow + Fire", "Harvest + Snow + Fire",
-                         "Wolves + Harvest + Snow + Fire")
-binary_matrix$prop <- c(0,0,0.41,0,0,.43,.28,0,.45,.45,0,.70,.48,.72,.5,.77)
-
-# Convert to long format for ggplot
-long_data <- binary_matrix %>%
-  pivot_longer(cols = starts_with("V"), names_to = "Item", values_to = "InSubset") %>%
-  mutate(Item = as.integer(gsub("V", "", Item)))
-
-
-long_data <- binary_matrix %>%
-  pivot_longer(-c(Subset, prop), names_to = "Item", values_to = "InSubset") %>%
-  mutate(Item = as.integer(gsub("V", "", Item)))  # Rename columns for clarity
-
-# bar plot
-ggplot(binary_matrix, aes(x = reorder(names, prop), y = prop)) +
-  geom_bar(stat = "identity", fill = "steelblue") +
-  coord_flip() +  # Flip for better readability
-  labs(x = "Subset", y = "Proportion", title = "Proportions by Subset") +
-  theme_minimal()
-
-
-# simpler bar plot (collapsed based on the # of "good" (0) covariates)
-zero <- 0
-one <- c(37.7,0,0,0)
-two <- c(0,0,40.8,42.6,45.0,51.4)
-three <- c(75.4,70.9,49.8,49.6)
-four <- c(77.2)
-
-blah <- data.frame(Variables = c("0","1","2","3","4"),
-                   mean = c(zero,mean(one),mean(two),mean(three),four),
-                   low = c(zero,zero,(mean(two)-sd(two)),(mean(three)-sd(three)),four),
-                   high = c(zero,(mean(one)+sd(one)),(mean(two)+sd(two)),(mean(three)+sd(three)),four))
-
-b <- ggplot(blah, aes(x = Variables, y = mean))+
-  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8)+
-  geom_errorbar(aes(ymin = low, ymax = high), width = 0.3, color = "black")+
-  coord_flip()+
-  labs(x = "# of Favorable Covariates", y = "% Escaping Predator Pit")+
-  theme_classic()+
-  theme(
-    panel.border = element_blank(), panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    axis.line = element_line(colour = "black"),
-    axis.title = element_text(size=24),
-    axis.text = element_text(size=18, color="black"),
-    legend.title = element_text(size = 24),
-    legend.text = element_text(size = 18))
-
-# combined figures
-library(patchwork)
-a+b+plot_annotation(tag_levels = "a")&theme(plot.tag = element_text(size = 24))
-
-ggsave("figure5_altalt.png", width = 12, height = 7, dpi = 600)
-
+# increasing wolves = less likely to escape predator pit (negative)
+# increasing harvest = less likely to escape predator pit (negative)
+# increasing snow = less likely to escape predator pit (negative)
+# increasing fire = more likely to escape predator pit (positive)
